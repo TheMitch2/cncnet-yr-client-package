@@ -1,20 +1,48 @@
 name: update-deploy
 
 on:
-  # Run on push to master
+  # Run on push to any branches listed
   push:
     branches:
-      - master
+      - develop
+      - qm
+      - quakenet
+  release:
+    types: [published]
   
   # Run this manually
   workflow_dispatch:
 
-  workflow_run:
-    # Run this after the release workflow has completed
-    workflows: [ release ]
-    types:
-      - completed
 jobs:
+  # This job validates a possible published release workflow trigger.
+  check-for-release:
+    runs-on: ubuntu-latest
+    outputs: 
+      result: ${{ steps.check-release.outputs.result }}
+    steps:
+      - name: Check for release
+        uses: actions/github-script@v6
+        id: set-result
+        with:
+          result-encoding: string
+          script: |
+            // This workflow was not triggered by a published release. No need to validate it.
+            if ('${{ github.event_name }}' != 'release') {
+              console.log('Not a release')
+              return ''
+            }
+            console.log('This is a published release. Validating tag name.')
+            
+            // This workflow was triggered by a published release. We need to validate that the tag 
+            // was created with the proper format for auto versioning. (GitVersion)
+            const tagRegex = /^refs\/tags\/yr-\d+.\d+(?:\.\d+){0,1}$/
+            const tagName = '${{ github.ref }}'
+            if (tagRegex.test(tagName)) {
+              console.log(`Valid tag name: ${tagName}`)
+              return ''
+            }
+            throw `Invalid tag specified: ${tagName}. Must be in the format 'yr-0.0' or 'yr-0.0.0'.`
+  
   # This job uses a Docker Ubuntu container to download necessary files/tools from the server to create the update.
   # An Ubuntu Docker container is necessary, because we have more control over what Ubuntu programs are available to us,
   # because we can install them into a Github workflow container.
@@ -22,6 +50,8 @@ jobs:
     # This job requires an Ubuntu platform so that it can create the Ubuntu Docker container.
     runs-on: ubuntu-latest
     environment: cncnet
+    needs: check-for-release
+    if: ${{ success() }}
 
     steps:
       # Checkout the repo
@@ -34,7 +64,7 @@ jobs:
       # This runs gitversion in a docker container and writes the output json to a local file.
       # This output file will be available in the uploaded artifact later in the workflow.
       - name: Run Gitversion Docker
-        run: docker run --rm -v "$(pwd):/repo" gittools/gitversion:latest-debian.10 /repo >gitversion.json
+        run: docker run --rm -v "$(pwd):/repo" gittools/gitversion:5.11.1-debian.10 /repo >gitversion.json
 
       # Get access to the properties from the gitversion output file
       - name: Get gitversion.json properties
@@ -49,7 +79,7 @@ jobs:
         run: sed -i "2 s/.*/${{steps.gitversion.outputs.SemVer}}/" versionconfig.ini
 
       # We need to download necessary "tools" for the update (including VersionWriter.exe). Github Workflow linux containers do 
-      # not the necessary programs installed by default and we do not have the ability to install it.
+      # not have the necessary programs installed by default and we do not have the ability to install it.
       # So, we use our own Docker container to do so.
 
       # Build the container from our Dockerfile
@@ -64,9 +94,10 @@ jobs:
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_PASS: ${{ secrets.SSH_PASS }}
           SSH_USER: ${{ secrets.SSH_USER }}
-          SSH_PATH_TOOLS: ${{ secrets.SSH_PATH_TOOLS }}
+          SSH_PATH_TOOLS_COMMON: ${{ secrets.SSH_PATH_TOOLS_COMMON }}
+          SSH_PATH_TOOLS_YR: ${{ secrets.SSH_PATH_TOOLS_YR }}
           SSH_PORT: ${{ secrets.SSH_PORT }}
-        run: docker run -v ${{ github.workspace }}:/download-tools -e SSH_KEY -e SSH_HOST -e SSH_PASS -e SSH_USER -e SSH_PATH_TOOLS -e SSH_PORT -i download-tools
+        run: docker run -v ${{ github.workspace }}:/download-tools -e SSH_KEY -e SSH_HOST -e SSH_PASS -e SSH_USER -e SSH_PATH_TOOLS_COMMON -e SSH_PATH_TOOLS_YR -e SSH_PORT -i download-tools
 
       # Archive this repo, excluding unnecessary files for the update
       - name: Zip dependencies
@@ -83,6 +114,8 @@ jobs:
   # Now, we need to actually run VersionWriter.exe.
 
   version-writer:
+    # if previous job was successful
+    if: ${{ success() }}
     # This jub runs runs on a Windows platform, because we need to run the VersionWriter executable.
     runs-on: windows-latest
     environment: cncnet
@@ -99,17 +132,7 @@ jobs:
       # Extract the archive
       - name: Extract archive
         run: 7z x archive.zip
-        
-      # Setup Compiler
-#      - name: Compile Installer
-##        if: {{steps.gitversion.outputs.PreReleaseLabel}} != 'dev'
-#        run: ./build_installer.bat
-#        working-directory: ./InnoSetup
-
-      # Clean up InnoSetup files
-      - name: Clean up InnoSetup files
-        run: rm -v -r InnoSetup
-
+      
       # Run the VersionWriter
       - name: Run VersionWriter.exe
         run: ./VersionWriter.exe /S
@@ -117,6 +140,27 @@ jobs:
       # Remove files we do not want in the new archive
       - name: Clean up files
         run: rm archive.zip && rm VersionWriter.exe && rm -r VersionWriter-CopiedFiles
+      
+      # Build CnCNet5_YR_Installer.exe
+      - name: Build Installer
+        run: build_installer.bat
+        shell: cmd
+        working-directory: ./InnoSetup
+
+      # Upload CnCNet5_YR_Installer.exe
+      - name: Upload installed exe
+        uses: actions/upload-artifact@v2
+        with:
+          name: installer
+          path: CnCNet5_YR_Installer.exe
+
+      # Clean up InnoSetup files
+      - name: Clean up InnoSetup files
+        run: rm -v -r InnoSetup
+
+      # Clean up CnCNet5_YR_Installer.exe
+      - name: Clean up CnCNet5_YR_Installer.exe
+        run: rm CnCNet5_YR_Installer.exe
 
       # Create new archive
       - name: Create new versioned archive
@@ -134,6 +178,8 @@ jobs:
 
   # This job creates the appropriate version folder on the server and uploads our updated files to it.
   upload-version:
+    # if previous job was successful
+    if: ${{ success() }}
     runs-on: ubuntu-latest
     environment: cncnet
     needs: version-writer
